@@ -1,0 +1,354 @@
+/**
+ * @file main_esp32.c
+ * @author KB2RWW (adapted for ESP32)
+ * @date 2025-12-21
+ * @brief Main function for CW Beacon programmable via serial port on ESP32
+ */
+
+/*
+ESP32 Pin Assignments for CW Beacon:
+
+Used I/O Pins:
+- GPIO 25: PWM output for CW tone (connect to speaker/amplifier)
+- GPIO 33: Inverted PWM output for CW tone (complementary to GPIO 25)
+- GPIO 26: Keying output (high when CW tone is active, for transmitter enable)
+- GPIO 27: Inverted keying output (low when CW tone is active, high when inactive)
+- GPIO 1 (TX): UART transmit (serial output to computer)
+- GPIO 3 (RX): UART receive (serial input from computer)
+
+Power: 3.3V, GND
+*/
+
+#include <Arduino.h>
+#include <Preferences.h>
+#include <string.h>
+
+// Preferences for saving settings
+Preferences prefs;
+
+// Global message
+char message[64] = "CQ CQ CQ KB2RWW beacken FN21US reply to kb2rww@gmail.com";
+
+// PWM for tone
+#define PWM_RESOLUTION 8  // 8-bit resolution
+#define PWM_FREQ 800      // Initial frequency
+
+// Pins
+#define TONE_PIN 25
+#define INV_TONE_PIN 33
+#define KEY_PIN 26
+#define INV_KEY_PIN 27
+
+// Macros for CW tone
+#define CW_TONE_ON() \
+  do { \
+    ledcWrite(TONE_PIN, 128); \
+    ledcWrite(INV_TONE_PIN, 127); \
+    digitalWrite(KEY_PIN, HIGH); \
+    digitalWrite(INV_KEY_PIN, LOW); \
+  } while (0)  // PWM on complementary, key high, inv key low
+#define CW_TONE_OFF() \
+  do { \
+    ledcWrite(TONE_PIN, 0); \
+    ledcWrite(INV_TONE_PIN, 0); \
+    digitalWrite(KEY_PIN, LOW); \
+    digitalWrite(INV_KEY_PIN, HIGH); \
+  } while (0)  // PWM off, key low, inv key high
+
+// Adjustable parameters
+unsigned int tone_freq = 800;
+unsigned int dot_time = 100;
+unsigned int dash_time = 300;
+unsigned int symbol_space = 100;
+unsigned int char_space = 300;
+unsigned int word_space = 700;
+
+// Morse code patterns (0 = dot, 1 = dash)
+const char* morse_code[41] = {
+  "01",      // A .-
+  "1000",    // B -...
+  "1010",    // C -.-.
+  "100",     // D -..
+  "0",       // E .
+  "0010",    // F ..-.
+  "110",     // G --.
+  "0000",    // H ....
+  "00",      // I ..
+  "0111",    // J .---
+  "101",     // K -.-
+  "0100",    // L .-..
+  "11",      // M --
+  "10",      // N -.
+  "111",     // O ---
+  "0110",    // P .--.
+  "1101",    // Q --.-
+  "010",     // R .-.
+  "000",     // S ...
+  "1",       // T -
+  "001",     // U ..-
+  "0001",    // V ...-
+  "011",     // W .--
+  "1001",    // X -..-
+  "1011",    // Y -.--
+  "1100",    // Z --..
+  "11111",   // 0 -----
+  "01111",   // 1 .----
+  "00111",   // 2 ..---
+  "00011",   // 3 ...--
+  "00001",   // 4 ....-
+  "00000",   // 5 .....
+  "10000",   // 6 -....
+  "11000",   // 7 --...
+  "11100",   // 8 ---..
+  "11110",   // 9 ----.
+  "010101",  // . .-.-.-
+  "110011",  // , --..--
+  "001100",  // ? ..--..
+  "10010",   // / -..-.
+  "011010",   // @ .--.-.
+
+};
+
+void init_pwm(void) {
+  // Configure PWM
+  ledcAttach(TONE_PIN, tone_freq, PWM_RESOLUTION);
+  ledcWrite(TONE_PIN, 0);  // Start off
+
+  ledcAttach(INV_TONE_PIN, tone_freq, PWM_RESOLUTION);
+  ledcWrite(INV_TONE_PIN, 0);  // Start off
+
+  // Set keying pins as outputs
+  pinMode(KEY_PIN, OUTPUT);
+  pinMode(INV_KEY_PIN, OUTPUT);
+  digitalWrite(KEY_PIN, LOW);
+  digitalWrite(INV_KEY_PIN, HIGH);
+}
+
+void init_serial(void) {
+  Serial.begin(115200);
+}
+
+void load_settings(void) {
+  prefs.begin("cw_beacon", false);
+  String msg = prefs.getString("message", "CQCQCQ KB2RWW beacken FN21us");
+  strcpy(message, msg.c_str());
+  tone_freq = prefs.getUInt("tone_freq", 800);
+  dot_time = prefs.getUInt("dot_time", 100);
+  dash_time = dot_time * 3;
+  symbol_space = dot_time;
+  char_space = dot_time * 3;
+  word_space = dot_time * 7;
+  ledcWriteTone(TONE_PIN, tone_freq);
+  ledcWriteTone(INV_TONE_PIN, tone_freq);
+  prefs.end();
+}
+
+void send_string(const char* str) {
+  Serial.print(str);
+}
+
+unsigned int parse_int(const char* str) {
+  unsigned int num = 0;
+  while (*str >= '0' && *str <= '9') {
+    num = num * 10 + (unsigned int)(*str - '0');
+    str++;
+  }
+  return num;
+}
+
+void play_symbol(char symbol) {
+  if (symbol == '0') {  // Dot
+    CW_TONE_ON();
+    delay(dot_time);
+    CW_TONE_OFF();
+  } else if (symbol == '1') {  // Dash
+    CW_TONE_ON();
+    delay(dash_time);
+    CW_TONE_OFF();
+  }
+}
+
+void play_morse(char letter) {
+  if (letter >= 'A' && letter <= 'Z') {
+    const char* code = morse_code[letter - 'A'];
+    while (*code) {
+      play_symbol(*code);
+      delay(symbol_space);
+      code++;
+    }
+  } else if (letter >= 'a' && letter <= 'z') {
+    const char* code = morse_code[letter - 'a'];
+    while (*code) {
+      play_symbol(*code);
+      delay(symbol_space);
+      code++;
+    }
+  } else if (letter == ' ') {
+    delay(word_space);
+    return;
+  } else if (letter >= '0' && letter <= '9') {
+    const char* code = morse_code[26 + (letter - '0')];
+    while (*code) {
+      play_symbol(*code);
+      delay(symbol_space);
+      code++;
+    }
+  }
+  delay(char_space);
+}
+
+void setup() {
+  init_pwm();
+  init_serial();
+  load_settings();
+  CW_TONE_OFF();  // Start with tone off and key low, inv key high
+}
+
+void loop() {
+
+  static char temp_message[64];
+  static int j = 0;
+
+  // Check for new message via serial
+  while (Serial.available() && j < 63) {
+    char received_char = Serial.read();
+    if (received_char == '\r' || received_char == '\n') {
+      temp_message[j] = '\0';
+      // Parse command
+      if (strcmp(temp_message, "H") == 0 || strcmp(temp_message, "?") == 0) {
+        // Send menu
+        send_string("CW Beacon Menu:\r\n");
+        send_string("MSG:<message> - Set CW message (up to 64 char)\r\n");
+        send_string("FREQ:<freq> - Set tone frequency in Hz\r\n");
+        send_string("SPEED:<wpm> - Set CW speed in WPM (5-25)\r\n");
+        send_string("H or ? - Show this menu\r\n");
+      } else if (strncmp(temp_message, "MSG:", 4) == 0) {
+        // Set message
+        strcpy(message, temp_message + 4);
+        prefs.begin("cw_beacon", false);
+        prefs.putString("message", message);
+        prefs.end();
+        send_string("Message set to: ");
+        send_string(message);
+        send_string("\r\n");
+      } else if (strncmp(temp_message, "FREQ:", 5) == 0) {
+        // Set frequency
+        tone_freq = parse_int(temp_message + 5);
+        ledcWriteTone(TONE_PIN, tone_freq);      // Update frequency
+        ledcWriteTone(INV_TONE_PIN, tone_freq);  // Update frequency for inv
+        prefs.begin("cw_beacon", false);
+        prefs.putUInt("tone_freq", tone_freq);
+        prefs.end();
+        send_string("Frequency set to: ");
+        // Convert tone_freq to string
+        char freq_str[10];
+        sprintf(freq_str, "%u", tone_freq);
+        send_string(freq_str);
+        send_string(" Hz\r\n");
+      } else if (strncmp(temp_message, "SPEED:", 6) == 0) {
+        // Set CW speed in WPM
+        unsigned int wpm = parse_int(temp_message + 6);
+        if (wpm >= 5 && wpm <= 25) {
+          dot_time = 1200 / wpm;
+          dash_time = dot_time * 3;
+          symbol_space = dot_time;
+          char_space = dot_time * 3;
+          word_space = dot_time * 7;
+          prefs.begin("cw_beacon", false);
+          prefs.putUInt("dot_time", dot_time);
+          prefs.end();
+          send_string("Speed set to: ");
+          char wpm_str[10];
+          sprintf(wpm_str, "%u", wpm);
+          send_string(wpm_str);
+          send_string(" WPM\r\n");
+        } else {
+          send_string("Invalid WPM. Use 5-25.\r\n");
+        }
+      }
+      j = 0;
+      break;
+    } else {
+      temp_message[j] = received_char;
+      j++;
+    }
+  }
+
+  // Play the current message
+  int i = 0;
+  while (message[i] != '\0') {
+    play_morse(message[i]);
+    i++;
+  }
+
+  // Continuous tone for 1/2 minute between cycles, checking serial
+  CW_TONE_ON();
+  unsigned long tone_start = millis();
+  while (millis() - tone_start < 10000) {
+    // Check serial during tone
+    while (Serial.available() && j < 63) {
+      char received_char = Serial.read();
+      if (received_char == '\r' || received_char == '\n') {
+        temp_message[j] = '\0';
+        // Parse command (same as above)
+        if (strcmp(temp_message, "H") == 0 || strcmp(temp_message, "?") == 0) {
+          // Send menu
+          send_string("CW Beacon Menu:\r\n");
+          send_string("MSG:<message> - Set CW message (up to 64 char)\r\n");
+          send_string("FREQ:<freq> - Set tone frequency in Hz\r\n");
+          send_string("SPEED:<wpm> - Set CW speed in WPM (5-25)\r\n");
+          send_string("H or ? - Show this menu\r\n");
+        } else if (strncmp(temp_message, "MSG:", 4) == 0) {
+          // Set message
+          strcpy(message, temp_message + 4);
+          send_string("Message set to: ");
+          send_string(message);
+          send_string("\r\n");
+        } else if (strncmp(temp_message, "FREQ:", 5) == 0) {
+          // Set frequency
+          tone_freq = parse_int(temp_message + 5);
+          ledcWriteTone(TONE_PIN, tone_freq);      // Update frequency
+          ledcWriteTone(INV_TONE_PIN, tone_freq);  // Update frequency for inv
+          prefs.begin("cw_beacon", false);
+          prefs.putUInt("tone_freq", tone_freq);
+          prefs.end();
+          send_string("Frequency set to: ");
+          // Convert tone_freq to string
+          char freq_str[10];
+          sprintf(freq_str, "%u", tone_freq);
+          send_string(freq_str);
+          send_string(" Hz\r\n");
+        } else if (strncmp(temp_message, "SPEED:", 6) == 0) {
+          // Set CW speed in WPM
+          unsigned int wpm = parse_int(temp_message + 6);
+          if (wpm >= 5 && wpm <= 25) {
+            dot_time = 1200 / wpm;
+            dash_time = dot_time * 3;
+            symbol_space = dot_time;
+            char_space = dot_time * 3;
+            word_space = dot_time * 7;
+            prefs.begin("cw_beacon", false);
+            prefs.putUInt("dot_time", dot_time);
+            prefs.end();
+            send_string("Speed set to: ");
+            char wpm_str[10];
+            sprintf(wpm_str, "%u", wpm);
+            send_string(wpm_str);
+            send_string(" WPM\r\n");
+          } else {
+            send_string("Invalid WPM. Use 5-25.\r\n");
+          }
+        }
+        j = 0;
+        break;
+      } else {
+        temp_message[j] = received_char;
+        j++;
+      }
+    }
+    delay(100);  // Poll every 100ms
+  }
+  CW_TONE_OFF();
+  //delay(30000); // 30 second silent pause after continuous tone
+  delay(1000);  // 500ms of no tone
+}
